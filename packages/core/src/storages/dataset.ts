@@ -1,7 +1,10 @@
+import type { Writable } from 'node:stream';
+
 import type { Awaitable, DatasetBackend, DatasetInfo, Dictionary, PaginatedList } from '@crawlee/types';
 import { z } from 'zod';
 
 import { tryCancel } from '@apify/timeout';
+import { jsonStringifyExtended } from '@apify/utilities';
 
 import { Configuration } from '../configuration.js';
 import { serviceLocator } from '../service-locator.js';
@@ -137,6 +140,48 @@ export interface DatasetIteratorOptions extends Omit<
 export interface DatasetExportToOptions extends DatasetExportOptions {
     fromDataset?: string | StorageIdentifier;
     toKVS?: string | StorageIdentifier;
+}
+
+/**
+ * Options for {@apilink Dataset.exportToStream}.
+ */
+export interface DatasetExportToStreamOptions extends DatasetExportOptions {
+    /**
+     * Number of items that should be skipped at the start of the export range. With `desc`, the offset
+     * is counted from the newest item, matching the `offset` semantics of {@apilink Dataset.getData}.
+     * @default 0
+     */
+    offset?: number;
+
+    /**
+     * Maximum number of items to export. When omitted, every remaining item in the frozen range is exported.
+     * @default undefined
+     */
+    limit?: number;
+
+    /**
+     * Output format. `json` writes a JSON array, `csv` writes CSV. Defaults to `json`.
+     * {@apilink DatasetExportToStreamOptions.contentType|contentType} takes precedence when both are set.
+     */
+    format?: 'json' | 'csv';
+
+    /**
+     * MIME type of the streamed output. Only `application/json` and `text/csv` are supported.
+     * @default 'application/json'
+     */
+    contentType?: 'application/json' | 'text/csv';
+
+    /**
+     * Number of items fetched by a single backend read. Bounds the memory used while streaming.
+     * @default 10000
+     */
+    pageSize?: number;
+
+    /**
+     * When aborted, the export rejects immediately and no further pages are read. The destination
+     * stream is left untouched (it is neither ended nor destroyed).
+     */
+    signal?: AbortSignal;
 }
 
 /**
@@ -482,6 +527,246 @@ export class Dataset<Data extends Dictionary = Dictionary> {
     }
 
     /**
+     * Streams the dataset into a caller-provided Node.js `Writable` as a JSON array or CSV.
+     *
+     * The export range is frozen when the call starts: items appended while the stream is being
+     * written are never included, and pagination advances over fixed indices, so a descending
+     * export cannot duplicate or skip items. CSV headers are taken from the same frozen range as
+     * the rows. Only one page of items (plus the set of CSV column names when `collectAllKeys` is
+     * enabled) is held in memory.
+     *
+     * The destination stream is never ended or destroyed - the caller owns it. `write()` returning
+     * `false` pauses the export until the stream emits `drain`. The returned promise rejects on
+     * backend, serialization or stream errors, on early stream closure, and when the `signal` is
+     * aborted; reading stops in all of those cases.
+     *
+     * This method cannot be used inside a storage transaction. Wrap it in
+     * {@apilink withDirectStorageAccess} if you need to call it from a request handler.
+     *
+     * **Example usage**
+     * ```javascript
+     * import { createWriteStream } from 'node:fs';
+     *
+     * // Stream the first 1000 items, newest first, as JSON
+     * await dataset.exportToStream(createWriteStream('results.json'), {
+     *   offset: 0,
+     *   limit: 1000,
+     *   desc: true,
+     * });
+     *
+     * // Stream a CSV whose header includes fields from every item in the range
+     * await dataset.exportToStream(writable, {
+     *   format: 'csv',
+     *   collectAllKeys: true,
+     * });
+     * ```
+     *
+     * @param stream The destination Node.js `Writable`. It is neither ended nor destroyed by this method.
+     * @param [options] Export options: `offset`, `limit`, `desc`, `collectAllKeys`, `format`/`contentType`,
+     *   `pageSize` and an optional `AbortSignal`.
+     * @param [contentType] Allows `application/json` (default) or `text/csv`; overrides the option.
+     */
+    async exportToStream(
+        stream: Writable,
+        options: DatasetExportToStreamOptions = {},
+        contentType?: string,
+    ): Promise<void> {
+        rejectOperationInTransaction(
+            'Dataset.exportToStream()',
+            'the caller owns the destination stream and writes cannot be rolled back.',
+        );
+
+        const format = resolveExportFormat(options, contentType);
+        const pageSize = options.pageSize ?? DATASET_ITERATORS_DEFAULT_LIMIT;
+
+        if (!Number.isInteger(pageSize) || pageSize <= 0) {
+            throw new Error('Dataset.exportToStream(): The "pageSize" option must be a positive integer.');
+        }
+
+        const offset = options.offset ?? 0;
+        const limit = options.limit;
+
+        if (!Number.isInteger(offset) || offset < 0) {
+            throw new Error('Dataset.exportToStream(): The "offset" option must be a non-negative integer.');
+        }
+
+        if (limit !== undefined && (!Number.isInteger(limit) || limit < 0)) {
+            throw new Error('Dataset.exportToStream(): The "limit" option must be a non-negative integer.');
+        }
+
+        const signal = options.signal;
+        assertOpenWritable(stream);
+
+        if (signal?.aborted) throw createAbortError(signal);
+
+        let failure: Error | undefined;
+        let rejectPendingWrite: ((error: Error) => void) | undefined;
+
+        const setFailure = (error: Error) => {
+            if (failure) return;
+            failure = error;
+            const reject = rejectPendingWrite;
+            rejectPendingWrite = undefined;
+            reject?.(error);
+        };
+
+        const throwIfStopped = () => {
+            if (failure) throw failure;
+            if (signal?.aborted) throw createAbortError(signal);
+            if (stream.destroyed || stream.writableEnded) throw createStreamClosedError();
+        };
+
+        const onError = (error: Error) => setFailure(error);
+        const onClose = () => setFailure(createStreamClosedError());
+        const onFinish = () => setFailure(createStreamClosedError());
+        const onAbort = () => setFailure(createAbortError(signal!));
+
+        const write = async (chunk: string): Promise<void> => {
+            throwIfStopped();
+
+            await new Promise<void>((resolve, reject) => {
+                let settled = false;
+                let drained = false;
+                let written = false;
+
+                const finish = (error?: Error) => {
+                    if (settled) return;
+                    settled = true;
+                    stream.off('drain', onDrain);
+                    rejectPendingWrite = undefined;
+
+                    if (error) reject(error);
+                    else resolve();
+                };
+
+                const maybeFinish = () => {
+                    if (drained && written) finish();
+                };
+
+                const onDrain = () => {
+                    drained = true;
+                    stream.off('drain', onDrain);
+                    maybeFinish();
+                };
+
+                rejectPendingWrite = finish;
+
+                let accepted: boolean;
+                try {
+                    // Waiting for the write callback also surfaces failures of chunks that were
+                    // accepted into the buffer but could not be flushed.
+                    accepted = stream.write(chunk, (error) => {
+                        written = true;
+                        if (error) finish(error);
+                        else maybeFinish();
+                    });
+                } catch (error) {
+                    finish(error as Error);
+                    return;
+                }
+
+                // The write callback may already have settled us (for example when it failed
+                // synchronously); in that case no drain listener may be registered.
+                if (settled) return;
+
+                if (accepted) {
+                    // The callback surfaces failures of a chunk that was accepted into the buffer
+                    // but could not be flushed; resolution waits for it.
+                    drained = true;
+                    maybeFinish();
+                } else {
+                    // The stream asked us to wait. No further backend read may start until it drains;
+                    // the callback is not required here, only `drain` (or a failure) advances us.
+                    written = true;
+                    stream.on('drain', onDrain);
+                }
+
+                // A failure can land between `write()` and the listener registration.
+                if (failure) finish(failure);
+            });
+
+            throwIfStopped();
+        };
+
+        stream.on('error', onError);
+        stream.on('close', onClose);
+        stream.on('finish', onFinish);
+        signal?.addEventListener('abort', onAbort);
+
+        try {
+            const total = (await this.backend.getMetadata()).itemCount;
+            throwIfStopped();
+
+            const { start, end, desc } = resolveExportRange(total, offset, limit, options.desc ?? false);
+            const createPages = () => this.#streamRange(start, end, desc, pageSize, throwIfStopped);
+
+            if (format === 'json') {
+                let opened = false;
+
+                for await (const items of createPages()) {
+                    for (const item of items) {
+                        if (!opened) {
+                            await write('[\n');
+                            opened = true;
+                        } else {
+                            await write(',\n');
+                        }
+
+                        const serialized = jsonStringifyExtended(item, null, 2);
+                        await write(`  ${serialized.replaceAll('\n', '\n  ')}`);
+                    }
+                }
+
+                // Matches what an empty `exportToJSON()` stores.
+                await write(opened ? '\n]' : '[]');
+                return;
+            }
+
+            const { stringify } = await import('csv-stringify/sync');
+            throwIfStopped();
+
+            let keys: string[] | undefined;
+
+            if (options.collectAllKeys) {
+                // Only the column-name set is retained; items are re-read from the same frozen range.
+                const collected = new Set<string>();
+
+                for await (const items of createPages()) {
+                    for (const item of items) {
+                        for (const key of Object.keys(item)) collected.add(key);
+                    }
+                }
+
+                keys = [...collected];
+            }
+
+            let headerWritten = false;
+
+            for await (const items of createPages()) {
+                if (items.length === 0) continue;
+
+                // The header and every row below come from the same frozen range.
+                keys ??= Object.keys(items[0]);
+
+                if (!headerWritten) {
+                    await write(stringify([keys]));
+                    headerWritten = true;
+                }
+
+                for (const item of items) {
+                    await write(stringify([keys.map((key) => item[key])]));
+                }
+            }
+        } finally {
+            stream.off('error', onError);
+            stream.off('close', onClose);
+            stream.off('finish', onFinish);
+            signal?.removeEventListener('abort', onAbort);
+            rejectPendingWrite = undefined;
+        }
+    }
+
+    /**
      * Returns an object containing general information about the dataset.
      *
      * **Example:**
@@ -687,6 +972,65 @@ export class Dataset<Data extends Dictionary = Dictionary> {
             yielded += page.items.length;
             if (page.items.length < fetchLimit || offset + page.items.length >= page.total) break;
             offset += page.items.length;
+        }
+    }
+
+    /**
+     * Reads the frozen `[start, end)` index range in the requested output order, one bounded page at
+     * a time. Descending output is served by reading ascending chunks from the end and reversing
+     * each chunk, so concurrent appends (which only grow the dataset past `end`) can never shift the
+     * window or produce duplicates.
+     */
+    async *#streamRange(
+        start: number,
+        end: number,
+        desc: boolean,
+        pageSize: number,
+        check: () => void,
+    ): AsyncGenerator<Data[]> {
+        if (!desc) {
+            let cursor = start;
+
+            while (cursor < end) {
+                check();
+
+                const limit = Math.min(pageSize, end - cursor);
+                this.#statsTracker.add('readCount');
+                const page = await this.backend.getData({ offset: cursor, limit, desc: false });
+                check();
+
+                const items = page.items.slice(0, limit);
+                cursor += items.length;
+
+                if (items.length === 0) return;
+
+                yield items;
+
+                if (items.length < limit) return;
+            }
+
+            return;
+        }
+
+        let cursor = end;
+
+        while (cursor > start) {
+            check();
+
+            const limit = Math.min(pageSize, cursor - start);
+            const offset = cursor - limit;
+            this.#statsTracker.add('readCount');
+            const page = await this.backend.getData({ offset, limit, desc: false });
+            check();
+
+            const items = page.items.slice(0, limit);
+            cursor = offset;
+
+            if (items.length === 0) return;
+
+            yield items.reverse();
+
+            if (items.length < limit) return;
         }
     }
 
@@ -923,4 +1267,86 @@ export interface DatasetContent<Data> {
     items: Data[];
     /** Should the results be in descending order. */
     desc?: boolean;
+}
+
+function resolveExportFormat(options: DatasetExportToStreamOptions, contentType?: string): 'json' | 'csv' {
+    const requested =
+        contentType ??
+        options.contentType ??
+        (options.format === 'csv' ? 'text/csv' : options.format === 'json' ? 'application/json' : undefined);
+
+    if (requested === undefined) return 'json';
+
+    const normalized = requested.toLowerCase().split(';', 1)[0].trim();
+
+    if (normalized === 'application/json') return 'json';
+    if (normalized === 'text/csv') return 'csv';
+
+    throw new Error(`Dataset.exportToStream(): Unsupported content type: ${requested}`);
+}
+
+/**
+ * Turns `offset`/`limit`/`desc` into the absolute ascending index range `[start, end)` that the
+ * export will read. `offset` keeps the {@apilink Dataset.getData} meaning: with `desc` it counts
+ * from the newest item. The range is computed from the item count captured before the first read,
+ * so later appends cannot enter it.
+ */
+function resolveExportRange(
+    total: number,
+    offset: number,
+    limit: number | undefined,
+    desc: boolean,
+): { start: number; end: number; desc: boolean } {
+    const skipped = Math.min(offset, total);
+
+    if (!desc) {
+        return {
+            start: skipped,
+            end: limit === undefined ? total : Math.min(total, skipped + limit),
+            desc,
+        };
+    }
+
+    // With `desc`, `offset` newest items are skipped and the window grows towards older indices.
+    const end = Math.max(0, total - skipped);
+    const start = limit === undefined ? 0 : Math.max(0, end - limit);
+
+    return { start, end, desc };
+}
+
+function assertOpenWritable(stream: unknown): asserts stream is Writable {
+    if (
+        stream === null ||
+        typeof stream !== 'object' ||
+        typeof (stream as Writable).write !== 'function' ||
+        typeof (stream as Writable).on !== 'function' ||
+        typeof (stream as Writable).off !== 'function'
+    ) {
+        throw new Error('Dataset.exportToStream(): The "stream" argument must be a writable Node.js stream.');
+    }
+
+    const writable = stream as Writable;
+
+    if (writable.destroyed || writable.writableEnded) {
+        throw createStreamClosedError();
+    }
+}
+
+function createStreamClosedError(): Error {
+    return new Error(
+        'Dataset.exportToStream(): The destination stream was closed or ended before the export finished.',
+    );
+}
+
+function createAbortError(signal: AbortSignal): Error {
+    if (signal.reason instanceof Error) return signal.reason;
+
+    const error = new Error(
+        signal.reason === undefined
+            ? 'Dataset.exportToStream() was aborted.'
+            : `Dataset.exportToStream() was aborted: ${String(signal.reason)}`,
+    );
+    error.name = 'AbortError';
+
+    return error;
 }
